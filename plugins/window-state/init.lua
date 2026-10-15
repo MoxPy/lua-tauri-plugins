@@ -89,7 +89,7 @@ function WindowStatePlugin.init(options)
 
         js = [[
             (function() {
-                window.__TAURI_WINDOW_STATE__ = {
+                const helper = {
                     save: function(label = "main") {
                         return window.__TAURI__.invoke('plugin:window-state|save', {
                             label: label,
@@ -107,6 +107,10 @@ function WindowStatePlugin.init(options)
                         return window.__TAURI__.invoke('plugin:window-state|restore', { label: label });
                     }
                 };
+                window.__TAURI_WINDOW_STATE__ = helper;
+                if (!window.__TAURI__) window.__TAURI__ = {};
+                window.__TAURI__.windowState = helper;
+                window.__TAURI__.window_state = helper;
             })();
         ]],
 
