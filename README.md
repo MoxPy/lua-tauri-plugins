@@ -137,7 +137,7 @@ if (!isAuto) {
 // ==========================================
 // 4. Window State Plugin (@tauri-apps/plugin-window-state parity)
 // ==========================================
-const savedState = await window.__TAURI_WINDOW_STATE__.restore('main');
+const savedState = await window.__TAURI__.windowState.restore('main');
 console.log("Restored dimensions:", savedState.width, savedState.height);
 ```
 
@@ -147,10 +147,12 @@ console.log("Restored dimensions:", savedState.width, savedState.height);
 
 Every plugin follows strict security principles to safeguard desktop users:
 
-1. **SQL Injection Defense (OWASP CWE-89):** Parameters are bound natively via prepared statements using `$1, $2, ...` or `?`. String concatenation is never performed.
-2. **Filesystem AppData Sandboxing:** Database files are automatically sandboxed in the OS application data directory (`~/Library/Application Support/`, `%APPDATA%`, or `~/.local/share/`), preventing unauthorized writes or read-only crashes in packaged applications.
-3. **CORS Bypass with Scoped Boundaries:** The HTTP plugin completely bypasses browser CORS limitations while enforcing explicit `allow`/`deny` URL wildcards, preventing unauthorized API exploitation from injected frontends.
-4. **Native OS Privilege Compliance:** Autostart configurations use per-user launch services (User Registry / LaunchAgent) without requiring root/administrator escalation.
+1. **Zero Command Injection (`os.execute` eliminated):** Directory creation uses memory-safe C FFI (`mkdir`/`_mkdir`) and Windows Autostart uses direct Win32 `advapi32.dll` registry APIs. Shell processes (`cmd.exe`, `sh`) are completely bypassed.
+2. **SQL Injection Defense (OWASP CWE-89):** Parameters are bound natively via prepared statements using `$1, $2, ...` or `?`. String concatenation is never performed.
+3. **Filesystem AppData Sandboxing & Traversal Rejection:** Relative database paths are automatically sandboxed in the OS application data directory (`~/Library/Application Support/`, `%APPDATA%`, or `~/.local/share/`). Directory traversal (`..`) is strictly blocked, and arbitrary absolute paths over IPC are rejected unless explicitly whitelisted in `options.allowed_paths`.
+4. **CORS Bypass with Scoped Boundaries & Redirect Verification:** The HTTP plugin completely bypasses browser CORS limitations while enforcing explicit `allow`/`deny` URL scopes. Redirects are checked on every hop to eliminate Server-Side Request Forgery (SSRF) bypasses.
+5. **Protocol Allowlist & TLS Hardening:** The HTTP plugin permits only `http://` and `https://` schemes (blocking `file://`, `gopher://`, etc.). TLS certificate verification cannot be disabled by frontend callers without explicit backend authorization (`allow_insecure_tls = true`).
+6. **Native OS Privilege Compliance:** Autostart configurations use per-user launch services (User Registry / LaunchAgent) with sanitized identifiers without requiring root/administrator escalation.
 
 ---
 

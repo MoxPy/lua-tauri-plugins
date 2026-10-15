@@ -53,3 +53,11 @@ await enable();
 // Disable launch at login
 await disable();
 ```
+
+
+---
+
+## Security Hardening
+* **Zero Command Injection:** Windows Registry operations use direct Win32 `advapi32.dll` FFI calls (`RegOpenKeyExA`, `RegQueryValueExA`, `RegSetValueExA`, `RegDeleteValueA`). Shell processes (`reg.exe`, `cmd.exe`, `os.execute`) are completely eliminated.
+* **Safe Directory Creation:** macOS LaunchAgent and Linux XDG autostart directories are created using native C FFI (`mkdir` / `_mkdir`).
+* **Identifier Sanitization:** App identifiers are sanitized and validated against `^[%w%-_%.]+$`, preventing path traversal (`..`) or injection metacharacters.

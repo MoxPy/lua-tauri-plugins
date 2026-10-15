@@ -9,7 +9,9 @@ Full 1:1 API parity with [`@tauri-apps/plugin-http`](https://github.com/tauri-ap
 ## Features
 * **Zero CORS Restrictions:** Performed natively by the backend runtime, not constrained by browser origin policies.
 * **Powered by `libcurl`:** Near-zero overhead, streaming, connection pooling, and HTTP/1.1 & HTTP/2 support.
-* **Strict Cybersecurity Scopes:** Configure `allow` and `deny` glob patterns to restrict outgoing requests.
+* **Strict Cybersecurity Scopes & SSRF Protection:** Configure `allow` and `deny` glob patterns. Redirects are re-validated on every hop to eliminate SSRF bypasses.
+* **Protocol Allowlist:** Strictly permits `http://` and `https://` protocols only; non-HTTP schemes like `file://` or `gopher://` are blocked.
+* **TLS Hardening:** Frontend callers cannot disable TLS verification unless explicitly authorized by backend configuration (`allow_insecure_tls = true`).
 * **Web Standard `fetch` Interface:** Identical to standard browser `fetch()`, returning `Response` with `.text()` and `.json()`.
 
 ---
@@ -66,3 +68,12 @@ const postRes = await fetch('https://httpbin.org/post', {
 });
 console.log("Response:", await postRes.json());
 ```
+
+
+---
+
+## Security Architecture & Hardening
+
+1. **Protocol Gating:** Requests to non-HTTP/HTTPS URLs (`file:///etc/passwd`, `gopher://`, `dict://`) are rejected at the native boundary and locked via `CURLOPT_PROTOCOLS`.
+2. **Per-Hop Redirect Validation (CWE-601 / SSRF):** Libcurl does not follow redirects blindly. An internal loop inspects the `Location` header and re-evaluates `assert_url_in_scope` before making subsequent requests.
+3. **TLS Verification Protection:** Insecure TLS (`danger.acceptInvalidCerts = true`) requested by frontend callers is rejected with a `Security violation` error unless explicitly enabled in `HttpPlugin.init({ allow_insecure_tls = true })` on the backend.

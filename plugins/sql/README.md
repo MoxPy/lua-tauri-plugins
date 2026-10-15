@@ -30,7 +30,7 @@ Full 1:1 API parity with [`@tauri-apps/plugin-sql`](https://github.com/tauri-app
 | Scheme | Format | Description & Resolution |
 | :--- | :--- | :--- |
 | **SQLite (AppData)** | `sqlite:app.db` | Automatically resolved inside the application's native OS AppData storage directory. |
-| **SQLite (Absolute)** | `sqlite:/path/to/data.db` | Connects directly to an absolute filesystem path. |
+| **SQLite (Absolute)** | `sqlite:/path/to/data.db` | Connects to an absolute filesystem path (over IPC requires backend whitelist in `allowed_paths`). |
 | **SQLite (In-Memory)** | `sqlite::memory:` | Fast, ephemeral in-memory database instance. |
 | **PostgreSQL** | `postgres://user:pass@host:5432/db` | Connects to remote or local PostgreSQL instances (`postgresql://` also supported). |
 | **MySQL / MariaDB** | `mysql://user:pass@host:3306/db` | Connects to remote or local MySQL / MariaDB instances. |
@@ -46,6 +46,12 @@ When using relative paths like `sqlite:production.db`, the plugin automatically 
 | **macOS** | `~/Library/Application Support/<app_id>/` |
 | **Windows** | `%APPDATA%\<app_id>\` |
 | **Linux** | `$XDG_DATA_HOME/<app_id>/` (or `~/.local/share/<app_id>/`) |
+
+### Security & Path Traversal Immunity
+* **Sandbox Confinement:** Relative paths (e.g. `sqlite:app.db`) resolve strictly within `get_app_data_dir(app)`.
+* **Path Traversal Rejection:** Any path containing `..` or null bytes is immediately rejected with a `Sandbox violation` error.
+* **IPC Absolute Path Gating:** Frontend callers via IPC cannot load arbitrary absolute paths unless explicitly whitelisted in `SqlPlugin.init({ allowed_paths = { "/path/to/db.db" } })` or `allow_ipc_absolute = true`.
+* **Zero Shell Execution:** Directory hierarchies are created using memory-safe native C FFI (`mkdir` / `_mkdir`), with zero `os.execute` invocations.
 
 ---
 

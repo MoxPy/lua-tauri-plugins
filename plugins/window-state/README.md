@@ -35,9 +35,17 @@ app:run()
 ## Frontend Usage (`JavaScript / TypeScript`)
 
 ```javascript
-// Using global injected helper
-await window.__TAURI_WINDOW_STATE__.save('main');
+// Using standard @tauri-apps/plugin-window-state parity:
+await window.__TAURI__.windowState.save('main');
 
-const state = await window.__TAURI_WINDOW_STATE__.restore('main');
+const state = await window.__TAURI__.windowState.restore('main');
 console.log("Restored size:", state.width, state.height);
+
+// window.__TAURI_WINDOW_STATE__ is also available as a direct alias
 ```
+
+---
+
+## Security Hardening
+* **Zero Command Injection:** Storage directories are created using native C FFI (`mkdir` / `_mkdir`), with zero shell or `os.execute` execution.
+* **Label Sanitization:** Window labels are validated against `^[%w%-_%.]+$`, preventing prototype pollution or illegal storage identifiers.
