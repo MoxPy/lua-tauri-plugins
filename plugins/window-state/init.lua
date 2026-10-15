@@ -1,0 +1,124 @@
+local WindowStatePlugin = {}
+WindowStatePlugin.__index = WindowStatePlugin
+
+local function get_json_codec(app)
+    if app and app.json then return app.json end
+    local ok, tauri = pcall(require, "tauri")
+    if ok and tauri and tauri.json then return tauri.json end
+    error("JSON codec not found on app instance or tauri module")
+end
+
+local function get_default_storage_path(app)
+    local app_name = (app.config.package and app.config.package.name) or app.config.productName or "tauri-app"
+    local home = os.getenv("HOME") or os.getenv("USERPROFILE") or "."
+    return home .. "/.local/share/" .. app_name .. "/window-state.json"
+end
+
+function WindowStatePlugin.init(options)
+    options = options or {}
+    local plugin_inst = setmetatable({}, WindowStatePlugin)
+    plugin_inst.name = "window-state"
+    plugin_inst.filename = options.filename
+    plugin_inst.state = {}
+
+    local function resolve_path(app)
+        return plugin_inst.filename or get_default_storage_path(app)
+    end
+
+    local function load_state(app)
+        local json = get_json_codec(app)
+        local path = resolve_path(app)
+        local f = io.open(path, "r")
+        if f then
+            local content = f:read("*a")
+            f:close()
+            local decoded = json.decode(content)
+            plugin_inst.state = decoded or {}
+        end
+        return plugin_inst.state
+    end
+
+    local function save_state(app, label, window_data)
+        local json = get_json_codec(app)
+        local path = resolve_path(app)
+        local parent = path:match("^(.*)/[^/]+$")
+        if parent and parent ~= "" then
+            os.execute("mkdir -p \"" .. parent .. "\" 2>/dev/null")
+        end
+
+        plugin_inst.state[label or "main"] = window_data
+
+        local f = io.open(path, "w")
+        if f then
+            local json_str = json.encode(plugin_inst.state)
+            f:write(json_str)
+            f:close()
+            return true
+        end
+        return false
+    end
+
+    return {
+        name = "window-state",
+
+        setup = function(app, self_plugin)
+            load_state(app)
+
+            -- 1. Save Window State
+            app:register("plugin:window-state|save", function(args)
+                local label = (type(args) == "table" and args.label) or "main"
+                local state_data = type(args) == "table" and (args.state or args) or {}
+                local ok = save_state(app, label, state_data)
+                return { success = ok }
+            end)
+
+            -- 2. Restore Window State
+            app:register("plugin:window-state|restore", function(args)
+                local label = (type(args) == "table" and args.label) or (type(args) == "string" and args) or "main"
+                load_state(app)
+                return plugin_inst.state[label] or {
+                    width = 960,
+                    height = 640,
+                    x = 100,
+                    y = 100,
+                    maximized = false,
+                    fullscreen = false
+                }
+            end)
+        end,
+
+        js = [[
+            (function() {
+                window.__TAURI_WINDOW_STATE__ = {
+                    save: function(label = "main") {
+                        return window.__TAURI__.invoke('plugin:window-state|save', {
+                            label: label,
+                            state: {
+                                width: window.outerWidth || window.innerWidth,
+                                height: window.outerHeight || window.innerHeight,
+                                screenX: window.screenX,
+                                screenY: window.screenY,
+                                maximized: false,
+                                fullscreen: !!document.fullscreenElement
+                            }
+                        });
+                    },
+                    restore: function(label = "main") {
+                        return window.__TAURI__.invoke('plugin:window-state|restore', { label: label });
+                    }
+                };
+            })();
+        ]],
+
+        on_window_close = function(app, event)
+            -- Auto-persist on close
+            save_state(app, event.label or "main", {
+                width = 960,
+                height = 640,
+                closedAt = os.time()
+            })
+        end
+    }
+end
+
+return WindowStatePlugin
