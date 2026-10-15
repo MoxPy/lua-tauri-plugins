@@ -1,16 +1,19 @@
-# Tauri-Lua Plugin: SQL (SQLite) 🗄️
+# Tauri-Lua Plugin: SQL 🗄️
 
-> **Fast, embedded SQL database plugin for Tauri-Lua powered by native SQLite3 via LuaJIT FFI.**
+> **Fast, embedded SQL database plugin for Tauri-Lua powered by native SQLite3 via LuaJIT FFI with automatic schema migrations, AppData path resolution, and parameter binding.**
 
-Full API parity with [`@tauri-apps/plugin-sql`](https://github.com/tauri-apps/plugins-workspace/tree/v2/plugins/sql).
+Full 1:1 API parity with [`@tauri-apps/plugin-sql`](https://github.com/tauri-apps/plugins-workspace/tree/v2/plugins/sql).
 
 ---
 
 ## Features
-* **Zero Compilation Needed:** Binds directly to the host operating system's native `sqlite3` library (`libsqlite3.dylib` on macOS, `libsqlite3.so` on Linux, `sqlite3.dll` on Windows) with zero C boilerplate.
-* **Prepared Statements & Parameter Binding:** Protects against SQL injections with automatic typing (`nil`, `boolean`, `integer`, `float`, `text`).
-* **Connection Pool:** Manage multiple distinct database files simultaneously.
-* **Guest JavaScript SDK:** Pre-injected `window.__TAURI__.sql.Database` and modular JS client.
+* **100% Tauri 2 Parity:** Fully compatible with `@tauri-apps/plugin-sql` JavaScript API and IPC protocols.
+* **Schema Migrations Engine:** Automatic, transaction-safe schema migrations (`_sqlx_migrations` table parity) running on database connect.
+* **AppData Sandboxed Paths:** `sqlite:myapp.db` automatically resolves inside the OS application support directory (`~/Library/Application Support/<app>` on macOS, `%APPDATA%` on Windows, `~/.local/share` on Linux) so packaged applications never fail with read-only file errors.
+* **Universal Parameter Syntax:** Supports `$1, $2, ...` (sqlx/Postgres standard), `?` positional parameters, and named parameters (`:name`, `$name`).
+* **Connection Pooling:** Manage multiple databases simultaneously.
+* **Preload Configuration:** Automatically preloads databases declared in `tauri.conf.json`.
+* **Zero Compilation Needed:** Binds directly to the native `sqlite3` shared library (`libsqlite3.dylib`, `libsqlite3.so`, `sqlite3.dll`) via LuaJIT FFI.
 
 ---
 
@@ -22,16 +25,30 @@ local sql = require("sql")
 
 local app = tauri.init()
 
--- Register plugin
-app:plugin(sql.init({ default_path = "myapp.db" }))
+-- 1. Configure Plugin with Automatic Migrations
+app:plugin(sql.init({
+    default_path = "sqlite:app.db",
+    migrations = {
+        {
+            version = 1,
+            description = "create_users_table",
+            sql = "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL);"
+        },
+        {
+            version = 2,
+            description = "add_email_column",
+            sql = "ALTER TABLE users ADD COLUMN email TEXT;"
+        }
+    }
+}))
 
--- Direct Lua access (optional)
-local res = sql.execute("myapp.db", "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, text TEXT);")
-sql.execute("myapp.db", "INSERT INTO notes (text) VALUES (?);", { "Hello from Lua backend!" })
+-- 2. Direct Lua API (optional)
+local res = sql.execute("sqlite:app.db", "INSERT INTO users (name, email) VALUES ($1, $2);", { "Alice", "alice@example.com" })
+print("Inserted row ID:", res.lastInsertId)
 
-local rows = sql.select("myapp.db", "SELECT * FROM notes;")
-for _, row in ipairs(rows) do
-    print("Note:", row.id, row.text)
+local users = sql.select("sqlite:app.db", "SELECT * FROM users WHERE id = $1;", { res.lastInsertId })
+for _, u in ipairs(users) do
+    print("User:", u.name, u.email)
 end
 
 app:run()
@@ -43,32 +60,39 @@ app:run()
 
 ```javascript
 import Database from './plugins/sql/guest-js';
-// Or use the automatically injected global:
+// Or use the pre-injected global:
 // const { Database } = window.__TAURI__.sql;
 
-// 1. Open or create database
-const db = await Database.load('sqlite:myapp.db');
+// 1. Connect to database (runs migrations automatically)
+const db = await Database.load('sqlite:app.db');
 
-// 2. Create table
-await db.execute(`
-  CREATE TABLE IF NOT EXISTS todos (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT NOT NULL,
-    done INTEGER DEFAULT 0
-  );
-`);
-
-// 3. Insert records with parameterized queries
+// 2. Insert records using $1, $2 or ?
 const result = await db.execute(
-  'INSERT INTO todos (title, done) VALUES (?, ?);',
-  ['Buy milk', 0]
+  'INSERT INTO users (name, email) VALUES ($1, $2);',
+  ['Bob', 'bob@example.com']
 );
-console.log(`Inserted row ID: ${result.lastInsertId}`);
+console.log(`Inserted ID: ${result.lastInsertId}, Rows affected: ${result.rowsAffected}`);
 
-// 4. Query records
-const todos = await db.select('SELECT * FROM todos WHERE done = ?;', [0]);
-console.table(todos);
+// 3. Query records
+const users = await db.select('SELECT * FROM users WHERE name = $1;', ['Bob']);
+console.table(users);
 
-// 5. Close database
+// 4. Close connection
 await db.close();
+```
+
+---
+
+## Declarative Preload (`tauri.conf.json`)
+
+```json
+{
+  "plugins": {
+    "sql": {
+      "preload": [
+        "sqlite:app.db"
+      ]
+    }
+  }
+}
 ```
