@@ -57,17 +57,42 @@ local CURLOPT_HEADERFUNCTION = 20079
 local CURLOPT_SSL_VERIFYPEER = 64
 local CURLOPT_SSL_VERIFYHOST = 81
 local CURLOPT_USERAGENT      = 10018
+local CURLOPT_PROTOCOLS       = 181
+local CURLOPT_REDIR_PROTOCOLS = 182
+
+-- Protocol constants
+local CURLPROTO_HTTP          = 1
+local CURLPROTO_HTTPS         = 2
+local ALLOWED_PROTOCOLS       = 3LL -- CURLPROTO_HTTP | CURLPROTO_HTTPS
 
 -- CURLINFO constants
 local CURLINFO_RESPONSE_CODE = 2097154
 local CURLINFO_EFFECTIVE_URL = 1048577
 
 -- ============================================================================
+-- Protocol Hardening (Only HTTP and HTTPS Permitted)
+-- ============================================================================
+local function assert_url_protocol(url)
+    if type(url) ~= "string" or url == "" then
+        error("URL must be a non-empty string")
+    end
+    local scheme = url:match("^([%a][%w%+%-%*]*)://")
+    if not scheme then
+        error(string.format("Invalid URL (missing or malformed protocol scheme): %s", url))
+    end
+    scheme = scheme:lower()
+    if scheme ~= "http" and scheme ~= "https" then
+        error(string.format("Disallowed protocol '%s:' in URL '%s'. Only 'http://' and 'https://' are permitted.", scheme, url))
+    end
+    return scheme
+end
+
+-- ============================================================================
 -- URL Scope Validation (Cybersecurity Glob Matching)
 -- ============================================================================
 local function url_matches_pattern(url, pattern)
-    local escaped = pattern:gsub("([%(%)%.%%%+%-%?%[%^%$])", "%%%1")
-    local lua_pat = "^" .. escaped:gsub("%%%*", ".*") .. "$"
+    local escaped = pattern:gsub("%%", "%%%%"):gsub("([%^%$%(%)%.%[%]%+%-%?])", "%%%1")
+    local lua_pat = "^" .. escaped:gsub("%*", ".*") .. "$"
     return url:match(lua_pat) ~= nil
 end
 
@@ -103,17 +128,53 @@ local function assert_url_in_scope(url, scopes)
 end
 
 -- ============================================================================
--- HTTP Request Core Execution
+-- Redirect URL Normalization
 -- ============================================================================
-local function perform_fetch(url, options, scopes)
+local function resolve_redirect_url(base_url, location)
+    if not location or location == "" then
+        return base_url
+    end
+    if location:match("^https?://") then
+        return location
+    end
+    if location:match("^//") then
+        local scheme = base_url:match("^(https?:)") or "http:"
+        return scheme .. location
+    end
+    if location:match("^/") then
+        local origin = base_url:match("^(https?://[^/]+)")
+        if origin then
+            return origin .. location
+        end
+    end
+    local base_prefix = base_url:match("^(https?://.*/)")
+    if base_prefix then
+        return base_prefix .. location
+    end
+    local origin = base_url:match("^(https?://[^?#]+)") or base_url
+    return origin .. "/" .. location
+end
+
+-- ============================================================================
+-- Single HTTP Hop Execution
+-- ============================================================================
+local function single_fetch(url, options, plugin_config)
     options = options or {}
     local method = (options.method or "GET"):upper()
-    assert_url_in_scope(url, scopes)
 
     local handle = curl_lib.curl_easy_init()
     if handle == nil then
         error("Failed to allocate curl handle")
     end
+
+    -- Restrict protocols strictly to HTTP and HTTPS at libcurl level
+    pcall(function()
+        curl_lib.curl_easy_setopt(handle, CURLOPT_PROTOCOLS, ALLOWED_PROTOCOLS)
+        curl_lib.curl_easy_setopt(handle, CURLOPT_REDIR_PROTOCOLS, ALLOWED_PROTOCOLS)
+    end)
+
+    -- Disable automatic redirects in libcurl: Lua loop re-validates scope per hop
+    curl_lib.curl_easy_setopt(handle, CURLOPT_FOLLOWLOCATION, 0LL)
 
     -- Set URL
     curl_lib.curl_easy_setopt(handle, CURLOPT_URL, url)
@@ -124,28 +185,25 @@ local function perform_fetch(url, options, scopes)
         curl_lib.curl_easy_setopt(handle, CURLOPT_CUSTOMREQUEST, method)
     end
 
-    -- Redirects
-    local max_redirs = tonumber(options.maxRedirections) or 5
-    if max_redirs > 0 then
-        curl_lib.curl_easy_setopt(handle, CURLOPT_FOLLOWLOCATION, 1)
-        curl_lib.curl_easy_setopt(handle, CURLOPT_MAXREDIRS, max_redirs)
-    else
-        curl_lib.curl_easy_setopt(handle, CURLOPT_FOLLOWLOCATION, 0)
-    end
-
     -- Timeouts (in milliseconds)
     local timeout_ms = tonumber(options.connectTimeout) or tonumber(options.timeout) or 30000
-    curl_lib.curl_easy_setopt(handle, CURLOPT_CONNECTTIMEOUT_MS, timeout_ms)
-    curl_lib.curl_easy_setopt(handle, CURLOPT_TIMEOUT_MS, timeout_ms)
+    curl_lib.curl_easy_setopt(handle, CURLOPT_CONNECTTIMEOUT_MS, ffi.cast("long", timeout_ms))
+    curl_lib.curl_easy_setopt(handle, CURLOPT_TIMEOUT_MS, ffi.cast("long", timeout_ms))
 
-    -- Danger options (SSL verification)
+    -- TLS Hardening: caller cannot disable verification unless backend authorized
     local danger = options.danger or {}
-    if danger.acceptInvalidCerts == true or danger.acceptInvalidHostnames == true then
-        curl_lib.curl_easy_setopt(handle, CURLOPT_SSL_VERIFYPEER, 0)
-        curl_lib.curl_easy_setopt(handle, CURLOPT_SSL_VERIFYHOST, 0)
+    local wants_insecure = (danger.acceptInvalidCerts == true or danger.acceptInvalidHostnames == true)
+    if wants_insecure then
+        local backend_allowed = plugin_config and (plugin_config.allow_insecure_tls == true or (type(plugin_config.danger) == "table" and plugin_config.danger.acceptInvalidCerts == true))
+        if not backend_allowed then
+            curl_lib.curl_easy_cleanup(handle)
+            error("Security violation: Disabling TLS verification (acceptInvalidCerts/acceptInvalidHostnames) is forbidden unless explicitly authorized in backend configuration (allow_insecure_tls = true).")
+        end
+        curl_lib.curl_easy_setopt(handle, CURLOPT_SSL_VERIFYPEER, 0LL)
+        curl_lib.curl_easy_setopt(handle, CURLOPT_SSL_VERIFYHOST, 0LL)
     else
-        curl_lib.curl_easy_setopt(handle, CURLOPT_SSL_VERIFYPEER, 1)
-        curl_lib.curl_easy_setopt(handle, CURLOPT_SSL_VERIFYHOST, 2)
+        curl_lib.curl_easy_setopt(handle, CURLOPT_SSL_VERIFYPEER, 1LL)
+        curl_lib.curl_easy_setopt(handle, CURLOPT_SSL_VERIFYHOST, 2LL)
     end
 
     -- Headers
@@ -174,7 +232,7 @@ local function perform_fetch(url, options, scopes)
             body_str = tostring(options.body)
         end
         curl_lib.curl_easy_setopt(handle, CURLOPT_POSTFIELDS, body_str)
-        curl_lib.curl_easy_setopt(handle, CURLOPT_POSTFIELDSIZE, #body_str)
+        curl_lib.curl_easy_setopt(handle, CURLOPT_POSTFIELDSIZE, ffi.cast("long", #body_str))
     end
 
     -- Body & Header Callbacks
@@ -239,23 +297,75 @@ local function perform_fetch(url, options, scopes)
 end
 
 -- ============================================================================
+-- HTTP Request Core Execution (With Per-Hop Scope & Protocol Verification)
+-- ============================================================================
+local function perform_fetch(url, options, scopes, plugin_config)
+    options = options or {}
+    local current_url = url
+    local current_options = {}
+    for k, v in pairs(options) do current_options[k] = v end
+
+    local max_redirs = tonumber(options.maxRedirections)
+    if max_redirs == nil then max_redirs = 5 end
+    local redirect_count = 0
+
+    while true do
+        -- 1. Validate protocol scheme (http/https only)
+        assert_url_protocol(current_url)
+
+        -- 2. Validate scopes (both allow and deny lists) on EVERY hop
+        assert_url_in_scope(current_url, scopes)
+
+        -- 3. Execute single request hop
+        local res = single_fetch(current_url, current_options, plugin_config)
+
+        -- 4. Check for redirect response
+        local is_redirect = (res.status == 301 or res.status == 302 or res.status == 303 or res.status == 307 or res.status == 308)
+        local location = res.headers and res.headers["location"]
+
+        if is_redirect and location and max_redirs > 0 then
+            if redirect_count >= max_redirs then
+                error(string.format("Maximum redirections (%d) exceeded for URL '%s'", max_redirs, url))
+            end
+            redirect_count = redirect_count + 1
+            local next_url = resolve_redirect_url(current_url, location)
+
+            -- Handle method rewrite for 303 or 301/302 POST -> GET
+            local meth = (current_options.method or "GET"):upper()
+            if res.status == 303 or ((res.status == 301 or res.status == 302) and meth == "POST") then
+                current_options.method = "GET"
+                current_options.body = nil
+            end
+
+            current_url = next_url
+        else
+            return res
+        end
+    end
+end
+
+-- ============================================================================
 -- HTTP Plugin Declaration
 -- ============================================================================
 local HttpPlugin = {}
 HttpPlugin.__index = HttpPlugin
 
 -- Static module methods for direct usage
-HttpPlugin.fetch = perform_fetch
+HttpPlugin.fetch = function(url, opts)
+    return perform_fetch(url, opts, nil, nil)
+end
+
 HttpPlugin.get = function(url, opts)
     opts = opts or {}
     opts.method = "GET"
-    return perform_fetch(url, opts)
+    return perform_fetch(url, opts, nil, nil)
 end
+
 HttpPlugin.post = function(url, body, opts)
     opts = opts or {}
     opts.method = "POST"
     opts.body = body
-    return perform_fetch(url, opts)
+    return perform_fetch(url, opts, nil, nil)
 end
 
 function HttpPlugin.init(options)
@@ -263,6 +373,7 @@ function HttpPlugin.init(options)
     local plugin_inst = setmetatable({}, HttpPlugin)
     plugin_inst.name = "http"
     plugin_inst.scopes = options.scope or options.scopes or {}
+    plugin_inst.allow_insecure_tls = options.allow_insecure_tls == true or (type(options.danger) == "table" and options.danger.acceptInvalidCerts == true)
     plugin_inst.app = nil
 
     return {
@@ -270,20 +381,20 @@ function HttpPlugin.init(options)
 
         -- Direct instance Lua API
         fetch = function(url, opts)
-            return perform_fetch(url, opts, plugin_inst.scopes)
+            return perform_fetch(url, opts, plugin_inst.scopes, plugin_inst)
         end,
 
         get = function(url, opts)
             opts = opts or {}
             opts.method = "GET"
-            return perform_fetch(url, opts, plugin_inst.scopes)
+            return perform_fetch(url, opts, plugin_inst.scopes, plugin_inst)
         end,
 
         post = function(url, body, opts)
             opts = opts or {}
             opts.method = "POST"
             opts.body = body
-            return perform_fetch(url, opts, plugin_inst.scopes)
+            return perform_fetch(url, opts, plugin_inst.scopes, plugin_inst)
         end,
 
         setup = function(app, self_plugin)
@@ -299,7 +410,7 @@ function HttpPlugin.init(options)
             app:register("plugin:http|fetch", function(args)
                 local url = type(args) == "table" and (args.url or args[1]) or args
                 local opts = type(args) == "table" and (args.options or args) or {}
-                return perform_fetch(url, opts, plugin_inst.scopes)
+                return perform_fetch(url, opts, plugin_inst.scopes, plugin_inst)
             end)
         end,
 

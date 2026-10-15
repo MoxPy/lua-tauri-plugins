@@ -32,6 +32,8 @@ int sqlite3_bind_parameter_index(sqlite3_stmt *stmt, const char *zName);
 
 int sqlite3_changes(sqlite3 *db);
 long long sqlite3_last_insert_rowid(sqlite3 *db);
+int mkdir(const char *pathname, unsigned int mode);
+int _mkdir(const char *pathname);
 ]])
 
 local function load_sqlite_lib()
@@ -76,22 +78,79 @@ local function get_app_data_dir(app)
     end
 end
 
-local function resolve_db_path(app, raw_path)
+local function safe_mkdir_p(target_path)
+    if not target_path or target_path == "" or target_path == "." or target_path == "/" then
+        return true
+    end
+    local normalized = target_path:gsub("\\", "/")
+    local prefix = ""
+    if normalized:match("^/") then
+        prefix = "/"
+        normalized = normalized:sub(2)
+    elseif normalized:match("^[A-Za-z]:/") then
+        prefix = normalized:sub(1, 3)
+        normalized = normalized:sub(4)
+    end
+
+    local current = prefix
+    for part in normalized:gmatch("[^/]+") do
+        if part ~= "" and part ~= "." then
+            current = (current == "" or current:match("/$")) and (current .. part) or (current .. "/" .. part)
+            if ffi.os == "Windows" then
+                pcall(function() ffi.C._mkdir(current) end)
+            else
+                pcall(function() ffi.C.mkdir(current, 493) end)
+            end
+        end
+    end
+    return true
+end
+
+local function resolve_db_path(app, raw_path, is_ipc, allowed_paths, allow_ipc_absolute)
     local path = (raw_path or ""):gsub("^sqlite:", "")
     if path == "" then path = "app.db" end
     if path == ":memory:" then return ":memory:" end
 
-    -- Absolute path check
-    if path:match("^/") or path:match("^[A-Za-z]:[/\\]") then
-        return path
+    if path:find("%z") then
+        error("Null byte detected in database path: " .. tostring(raw_path))
+    end
+
+    -- Normalize slashes for traversal check
+    local norm = path:gsub("\\", "/")
+    -- Check for directory traversal
+    if norm:match("(^|/)%.%.(/|$)") or norm:find("%.%.") then
+        error(string.format("Sandbox violation: path traversal ('..') is forbidden in database path: '%s'", raw_path))
+    end
+
+    local is_abs = norm:match("^/") or norm:match("^[A-Za-z]:/")
+
+    if is_abs then
+        if is_ipc and not allow_ipc_absolute then
+            local is_allowed = false
+            for _, allowed in ipairs(allowed_paths or {}) do
+                local norm_allowed = allowed:gsub("\\", "/")
+                if norm == norm_allowed or norm:sub(1, #norm_allowed + 1) == (norm_allowed .. "/") then
+                    is_allowed = true
+                    break
+                end
+            end
+            if not is_allowed then
+                error(string.format("Sandbox violation: caller-provided absolute path '%s' is not in allowed_paths", raw_path))
+            end
+        end
+        local parent = norm:match("^(.*)/[^/]+$")
+        if parent and parent ~= "" then
+            safe_mkdir_p(parent)
+        end
+        return norm
     end
 
     -- Sandbox relative path inside OS AppData directory
     local base_dir = get_app_data_dir(app)
-    local full_path = base_dir .. "/" .. path
+    local full_path = base_dir:gsub("\\", "/") .. "/" .. norm
     local parent = full_path:match("^(.*)/[^/]+$")
     if parent and parent ~= "" then
-        os.execute("mkdir -p \"" .. parent .. "\" 2>/dev/null")
+        safe_mkdir_p(parent)
     end
     return full_path
 end
@@ -307,9 +366,11 @@ function SQLPlugin.init(options)
     plugin_inst.db_pool = {}
     plugin_inst.migrations = options.migrations or {}
     plugin_inst.default_path = options.default_path or "sqlite:app.db"
+    plugin_inst.allowed_paths = options.allowed_paths or {}
+    plugin_inst.allow_ipc_absolute = options.allow_ipc_absolute == true
     plugin_inst.app = nil
 
-    local function get_or_connect(db_key, load_options)
+    local function get_or_connect(db_key, load_options, is_ipc)
         load_options = load_options or {}
         local auto_create = load_options.autoCreate ~= false
 
@@ -321,7 +382,7 @@ function SQLPlugin.init(options)
         local scheme = db_key:match("^([%a%d]+):") or "sqlite"
 
         if scheme == "sqlite" then
-            local resolved_path = resolve_db_path(plugin_inst.app, db_key)
+            local resolved_path = resolve_db_path(plugin_inst.app, db_key, is_ipc, plugin_inst.allowed_paths, plugin_inst.allow_ipc_absolute)
 
             if not auto_create and resolved_path ~= ":memory:" then
                 local f = io.open(resolved_path, "r")
@@ -398,7 +459,7 @@ function SQLPlugin.init(options)
             app:register("plugin:sql|load", function(args)
                 local db_path = type(args) == "table" and (args.db or args.path) or args
                 local opts = type(args) == "table" and (args.options or args) or {}
-                get_or_connect(db_path, opts)
+                get_or_connect(db_path, opts, true)
                 return db_path
             end)
 
@@ -407,7 +468,7 @@ function SQLPlugin.init(options)
                 local db_path = args.db or args.path or plugin_inst.default_path
                 local query = args.query or args[1] or ""
                 local values = args.values or args.params or args[2] or {}
-                local driver = get_or_connect(db_path)
+                local driver = get_or_connect(db_path, nil, true)
                 return driver:execute(query, values)
             end)
 
@@ -416,7 +477,7 @@ function SQLPlugin.init(options)
                 local db_path = args.db or args.path or plugin_inst.default_path
                 local query = args.query or args[1] or ""
                 local values = args.values or args.params or args[2] or {}
-                local driver = get_or_connect(db_path)
+                local driver = get_or_connect(db_path, nil, true)
                 return driver:select(query, values)
             end)
 
