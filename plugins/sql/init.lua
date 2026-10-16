@@ -58,6 +58,12 @@ local sql_lib = load_sqlite_lib()
 -- ============================================================================
 -- Path Resolution (App-Sandboxed Storage)
 -- ============================================================================
+-- Mask URI credentials (e.g. postgres://user:password@host/db -> postgres://user:***@host/db)
+local function mask_db_credentials(url)
+    if not url or type(url) ~= "string" then return tostring(url) end
+    return url:gsub("://([^:]+):([^@]+)@", "://%1:***@")
+end
+
 local function get_app_data_dir(app)
     local app_id = (app.config.package and app.config.package.name) or app.config.productName or "tauri-app"
     local os_name = ffi.os
@@ -368,6 +374,7 @@ function SQLPlugin.init(options)
     plugin_inst.default_path = options.default_path or "sqlite:app.db"
     plugin_inst.allowed_paths = options.allowed_paths or {}
     plugin_inst.allow_ipc_absolute = options.allow_ipc_absolute == true
+    plugin_inst.allowed_connections = options.allowed_connections or options.scope or {}
     plugin_inst.app = nil
 
     local function get_or_connect(db_key, load_options, is_ipc)
@@ -375,6 +382,28 @@ function SQLPlugin.init(options)
         local auto_create = load_options.autoCreate ~= false
 
         db_key = db_key or plugin_inst.default_path
+
+        -- Scope validation on IPC connections: allowlist of DB/host/path
+        if is_ipc and plugin_inst.allowed_connections and #plugin_inst.allowed_connections > 0 then
+            local permitted = false
+            for _, pat in ipairs(plugin_inst.allowed_connections) do
+                if pat == "*" or pat == db_key then
+                    permitted = true
+                    break
+                else
+                    -- Glob match for connections
+                    local esc = pat:gsub("%%", "%%%%"):gsub("([%^%$%(%)%.%[%]%+%-%?])", "%%%1"):gsub("%*", ".*")
+                    if db_key:match("^" .. esc .. "$") then
+                        permitted = true
+                        break
+                    end
+                end
+            end
+            if not permitted then
+                error(string.format("Access denied by SQL scope: connection '%s' is not in allowed_connections", mask_db_credentials(db_key)))
+            end
+        end
+
         if plugin_inst.db_pool[db_key] then
             return plugin_inst.db_pool[db_key]
         end
@@ -411,9 +440,9 @@ function SQLPlugin.init(options)
 
             return driver
         elseif scheme == "postgres" or scheme == "postgresql" then
-            error("PostgreSQL driver connection planned. URL: " .. db_key)
+            error("PostgreSQL driver connection planned. URL: " .. mask_db_credentials(db_key))
         elseif scheme == "mysql" then
-            error("MySQL driver connection planned. URL: " .. db_key)
+            error("MySQL driver connection planned. URL: " .. mask_db_credentials(db_key))
         else
             error("Unsupported database driver scheme: " .. scheme)
         end
@@ -449,6 +478,11 @@ function SQLPlugin.init(options)
             -- 1. Preload databases configured in tauri.conf.json
             local tauri_plugins = app.config.plugins or (app.config.tauri and app.config.tauri.plugins) or {}
             local sql_conf = tauri_plugins.sql or {}
+            if type(sql_conf.allowed_connections) == "table" then
+                plugin_inst.allowed_connections = sql_conf.allowed_connections
+            elseif type(sql_conf.scope) == "table" then
+                plugin_inst.allowed_connections = sql_conf.scope
+            end
             if type(sql_conf.preload) == "table" then
                 for _, db_url in ipairs(sql_conf.preload) do
                     get_or_connect(db_url, { autoCreate = true })
@@ -541,4 +575,6 @@ function SQLPlugin.init(options)
     }
 end
 
+
+pcall(function() package.loaded["tauri.plugin.sql"] = SQLPlugin end)
 return SQLPlugin
