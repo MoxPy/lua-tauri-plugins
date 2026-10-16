@@ -323,4 +323,6 @@ StartupNotify=false
     }
 end
 
+
+pcall(function() package.loaded["tauri.plugin.autostart"] = AutostartPlugin end)
 return AutostartPlugin

@@ -173,4 +173,6 @@ function WindowStatePlugin.init(options)
     }
 end
 
+
+pcall(function() package.loaded["tauri.plugin.window_state"] = WindowStatePlugin end)
 return WindowStatePlugin
