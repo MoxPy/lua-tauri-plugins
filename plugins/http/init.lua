@@ -88,15 +88,144 @@ local function assert_url_protocol(url)
 end
 
 -- ============================================================================
--- URL Scope Validation (Cybersecurity Glob Matching)
+-- URL Scope Validation (Robust URL Parsing, Path Normalization & SSRF Defense)
 -- ============================================================================
-local function url_matches_pattern(url, pattern)
-    local escaped = pattern:gsub("%%", "%%%%"):gsub("([%^%$%(%)%.%[%]%+%-%?])", "%%%1")
-    local lua_pat = "^" .. escaped:gsub("%*", ".*") .. "$"
-    return url:match(lua_pat) ~= nil
+local function normalize_path(path)
+    if not path or path == "" then return "/" end
+    path = path:gsub("%%2[eE]", ".")
+    path = path:gsub("/+", "/")
+    local segments = {}
+    for seg in path:gmatch("[^/]+") do
+        if seg == "." then
+            -- current dir, skip
+        elseif seg == ".." then
+            if #segments > 0 then table.remove(segments) end
+        else
+            table.insert(segments, seg)
+        end
+    end
+    local result = "/" .. table.concat(segments, "/")
+    if path:match("/$") and result ~= "/" then
+        result = result .. "/"
+    end
+    return result
+end
+
+local function parse_url(raw_url)
+    if type(raw_url) ~= "string" or raw_url == "" then
+        return nil, "URL must be a non-empty string"
+    end
+    local scheme, rest = raw_url:match("^([%a][%w%+%-%*]*)://(.*)$")
+    if not scheme then
+        return nil, "Invalid URL scheme"
+    end
+    scheme = scheme:lower()
+    if scheme ~= "http" and scheme ~= "https" then
+        return nil, "Disallowed scheme: " .. scheme
+    end
+
+    local authority, path_and_more = rest:match("^([^/?#]*)(.*)$")
+    authority = authority or ""
+    path_and_more = path_and_more or ""
+
+    local userinfo, host_port = authority:match("^(.-)@(.*)$")
+    if not host_port then host_port = authority end
+
+    local host, port
+    if host_port:sub(1, 1) == "[" then
+        host, port = host_port:match("^%[([^%]]+)%]%:?(%d*)$")
+    else
+        host, port = host_port:match("^([^:]+):?(%d*)$")
+    end
+    if not host or host == "" then
+        return nil, "Invalid host in URL"
+    end
+    host = host:lower()
+    port = tonumber(port) or (scheme == "https" and 443 or 80)
+
+    local path = path_and_more:match("^([^?#]*)") or "/"
+    path = normalize_path(path)
+
+    return {
+        scheme = scheme,
+        host = host,
+        port = port,
+        path = path,
+        raw = raw_url
+    }
+end
+
+local function is_private_or_local_host(host)
+    if host == "localhost" or host == "127.0.0.1" or host == "::1" or host == "0.0.0.0" then
+        return true, "loopback"
+    end
+    local o1, o2, o3, o4 = host:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
+    if o1 and o2 and o3 and o4 then
+        o1, o2, o3, o4 = tonumber(o1), tonumber(o2), tonumber(o3), tonumber(o4)
+        if o1 == 127 then return true, "loopback" end
+        if o1 == 10 then return true, "private (10.0.0.0/8)" end
+        if o1 == 172 and (o2 >= 16 and o2 <= 31) then return true, "private (172.16.0.0/12)" end
+        if o1 == 192 and o2 == 168 then return true, "private (192.168.0.0/16)" end
+        if o1 == 169 and o2 == 254 then return true, "link-local (169.254.0.0/16)" end
+        if o1 == 0 then return true, "unspecified (0.0.0.0)" end
+    end
+    if host:match("^fe[89ab][0-9a-f]") or host:match("^fc") or host:match("^fd") then
+        return true, "private/link-local IPv6"
+    end
+    return false, nil
+end
+
+local function host_matches(host, pattern_host)
+    if pattern_host == "*" then return true end
+    if pattern_host:sub(1, 2) == "*." then
+        local domain = pattern_host:sub(3)
+        return host == domain or host:sub(-#domain - 1) == "." .. domain
+    end
+    return host == pattern_host
+end
+
+local function path_matches(path, pattern_path)
+    if not pattern_path or pattern_path == "" or pattern_path == "*" or pattern_path == "/*" then
+        return true
+    end
+    pattern_path = normalize_path(pattern_path)
+    if pattern_path:sub(-1) == "*" then
+        local prefix = pattern_path:sub(1, -2)
+        return path:sub(1, #prefix) == prefix
+    end
+    return path == pattern_path
+end
+
+local function url_matches_parsed_pattern(parsed, pattern_str)
+    if pattern_str == "*" then return true end
+    local pat_parsed = parse_url(pattern_str)
+    if not pat_parsed then
+        -- fallback to glob match if pattern is a relative path or wildcard domain
+        return false
+    end
+    if pat_parsed.scheme ~= parsed.scheme then return false end
+    if not host_matches(parsed.host, pat_parsed.host) then return false end
+    if pat_parsed.port and pat_parsed.port ~= parsed.port then return false end
+    return path_matches(parsed.path, pat_parsed.path)
 end
 
 local function assert_url_in_scope(url, scopes)
+    local parsed, err = parse_url(url)
+    if not parsed then
+        error(string.format("HTTP scope validation failed: %s (%s)", tostring(err), url))
+    end
+
+    scopes = scopes or {}
+    local allow_private = scopes.allow_private_networks == true
+
+    -- Default: block loopback, link-local and private networks unless explicitly permitted
+    if not allow_private then
+        local is_priv, reason = is_private_or_local_host(parsed.host)
+        if is_priv then
+            error(string.format("Access to %s address '%s' is blocked by default HTTP security scope", reason, parsed.host))
+        end
+    end
+
     if not scopes or (#(scopes.allow or {}) == 0 and #(scopes.deny or {}) == 0) then
         return true
     end
@@ -104,7 +233,7 @@ local function assert_url_in_scope(url, scopes)
     -- 1. Check deny list first
     for _, item in ipairs(scopes.deny or {}) do
         local pattern = type(item) == "table" and item.url or item
-        if url_matches_pattern(url, pattern) then
+        if url_matches_parsed_pattern(parsed, pattern) then
             error(string.format("Access denied by HTTP scope (deny list): %s", url))
         end
     end
@@ -114,7 +243,7 @@ local function assert_url_in_scope(url, scopes)
         local allowed = false
         for _, item in ipairs(scopes.allow) do
             local pattern = type(item) == "table" and item.url or item
-            if url_matches_pattern(url, pattern) then
+            if url_matches_parsed_pattern(parsed, pattern) then
                 allowed = true
                 break
             end
@@ -450,4 +579,6 @@ function HttpPlugin.init(options)
     }
 end
 
+
+pcall(function() package.loaded["tauri.plugin.http"] = HttpPlugin end)
 return HttpPlugin

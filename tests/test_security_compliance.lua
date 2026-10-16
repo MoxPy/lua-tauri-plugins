@@ -211,6 +211,76 @@ it("Enforces HTTP scope check on redirects (Blocks SSRF redirect bypass)", funct
         "Expected HTTP scope access denial on redirect, got: " .. tostring(err))
 end)
 
+it("HTTP Scope blocks loopback, private networks and cloud metadata (SSRF defense)", function()
+    local app = create_mock_app("http-sec-app")
+    local plugin = HttpPlugin.init({
+        scopes = { allow = { "http://*/*" } }
+    })
+    plugin.setup(app, plugin)
+
+    -- Loopback
+    local ok1, err1 = pcall(function()
+        app.handlers["plugin:http|fetch"]({ url = "http://127.0.0.1:8080/admin" })
+    end)
+    assert(not ok1 and string.find(tostring(err1), "blocked by default HTTP security scope", 1, true))
+
+    -- Cloud metadata service
+    local ok2, err2 = pcall(function()
+        app.handlers["plugin:http|fetch"]({ url = "http://169.254.169.254/latest/meta-data/" })
+    end)
+    assert(not ok2 and string.find(tostring(err2), "blocked by default HTTP security scope", 1, true))
+
+    -- Private network 10.0.0.1
+    local ok3, err3 = pcall(function()
+        app.handlers["plugin:http|fetch"]({ url = "http://10.0.0.1/status" })
+    end)
+    assert(not ok3 and string.find(tostring(err3), "blocked by default HTTP security scope", 1, true))
+end)
+
+it("HTTP Scope parses URL and blocks host confusion and traversal bypasses", function()
+    local app = create_mock_app("http-sec-app")
+    local plugin = HttpPlugin.init({
+        scopes = { allow = { "https://api.example.com/v1/*" } }
+    })
+    plugin.setup(app, plugin)
+
+    -- Host confusion / prefix: evil.com/.api.example.com
+    local ok1, err1 = pcall(function()
+        app.handlers["plugin:http|fetch"]({ url = "https://evil.com/.api.example.com/v1/data" })
+    end)
+    assert(not ok1 and string.find(tostring(err1), "not in allow list", 1, true))
+
+    -- Traversal bypass using %2e%2e/ out of scope
+    local ok2, err2 = pcall(function()
+        app.handlers["plugin:http|fetch"]({ url = "https://api.example.com/v1/%2e%2e/admin/secrets" })
+    end)
+    assert(not ok2 and string.find(tostring(err2), "not in allow list", 1, true))
+end)
+
+it("SQL Connection Scope restricts database connections and masks credentials", function()
+    local SQLPlugin = require("plugins.sql.init")
+    local app = create_mock_app("sql-sec-app")
+    local plugin = SQLPlugin.init({
+        allowed_connections = { "sqlite:allowed.db" }
+    })
+    plugin.setup(app, plugin)
+
+    -- Denied connection
+    local ok1, err1 = pcall(function()
+        app.handlers["plugin:sql|load"]({ db = "sqlite:unauthorized.db" })
+    end)
+    assert(not ok1, "Unauthorized connection must fail")
+    assert(string.find(tostring(err1), "Access denied by SQL scope", 1, true))
+
+    -- Masked credentials in error
+    local ok2, err2 = pcall(function()
+        app.handlers["plugin:sql|load"]({ db = "postgres://admin:SuperSecretPassword123@db.internal:5432/finance" })
+    end)
+    assert(not ok2)
+    assert(not string.find(tostring(err2), "SuperSecretPassword123", 1, true), "Password must be masked")
+    assert(string.find(tostring(err2), "admin:***", 1, true), "Masked pattern expected")
+end)
+
 print(string.format("\n======================================================="))
 print(string.format("ALL %d COMPLIANCE TESTS PASSED SUCCESSFULLY!", passed_count))
 print("=======================================================\n")
