@@ -59,6 +59,9 @@ local CURLOPT_SSL_VERIFYHOST = 81
 local CURLOPT_USERAGENT      = 10018
 local CURLOPT_PROTOCOLS       = 181
 local CURLOPT_REDIR_PROTOCOLS = 182
+local CURLOPT_COOKIE         = 10022
+local CURLOPT_COOKIEFILE     = 10031
+local CURLOPT_COOKIEJAR      = 10082
 
 -- Protocol constants
 local CURLPROTO_HTTP          = 1
@@ -335,6 +338,22 @@ local function single_fetch(url, options, plugin_config)
         curl_lib.curl_easy_setopt(handle, CURLOPT_SSL_VERIFYHOST, 2LL)
     end
 
+    -- Cookie Jar & Cookie File Support
+    local cookie_target = options.cookieJar or options.cookieFile or (plugin_config and (plugin_config.cookie_jar or plugin_config.cookie_file or plugin_config.cookieJar or plugin_config.cookieFile))
+    if cookie_target then
+        if type(cookie_target) == "string" and cookie_target ~= "" then
+            curl_lib.curl_easy_setopt(handle, CURLOPT_COOKIEFILE, cookie_target)
+            curl_lib.curl_easy_setopt(handle, CURLOPT_COOKIEJAR, cookie_target)
+        elseif cookie_target == true or cookie_target == "" then
+            -- Activate in-memory cookie engine
+            curl_lib.curl_easy_setopt(handle, CURLOPT_COOKIEFILE, "")
+        end
+    end
+
+    if options.cookie and type(options.cookie) == "string" then
+        curl_lib.curl_easy_setopt(handle, CURLOPT_COOKIE, options.cookie)
+    end
+
     -- Headers
     local header_list = nil
     if type(options.headers) == "table" then
@@ -362,11 +381,15 @@ local function single_fetch(url, options, plugin_config)
         end
         curl_lib.curl_easy_setopt(handle, CURLOPT_POSTFIELDS, body_str)
         curl_lib.curl_easy_setopt(handle, CURLOPT_POSTFIELDSIZE, ffi.cast("long", #body_str))
+    elseif method == "POST" or method == "PUT" or method == "PATCH" then
+        curl_lib.curl_easy_setopt(handle, CURLOPT_POSTFIELDS, "")
+        curl_lib.curl_easy_setopt(handle, CURLOPT_POSTFIELDSIZE, 0LL)
     end
 
     -- Body & Header Callbacks
     local body_chunks = {}
     local response_headers = {}
+    local response_cookies = {}
 
     local write_cb = ffi.cast("curl_write_callback", function(ptr, size, nmemb, userdata)
         local total = size * nmemb
@@ -379,7 +402,19 @@ local function single_fetch(url, options, plugin_config)
         local raw_line = ffi.string(ptr, total)
         local k, v = raw_line:match("^([^:]+):%s*(.-)[\r\n]*$")
         if k and v then
-            response_headers[k:lower()] = v
+            local lk = k:lower()
+            if lk == "set-cookie" then
+                table.insert(response_cookies, v)
+            end
+            if response_headers[lk] then
+                if type(response_headers[lk]) == "table" then
+                    table.insert(response_headers[lk], v)
+                else
+                    response_headers[lk] = { response_headers[lk], v }
+                end
+            else
+                response_headers[lk] = v
+            end
         end
         return total
     end)
@@ -420,6 +455,7 @@ local function single_fetch(url, options, plugin_config)
         statusText = status_text,
         ok = (status_code >= 200 and status_code < 300),
         headers = response_headers,
+        cookies = response_cookies,
         url = final_url,
         data = full_body
     }
@@ -503,6 +539,7 @@ function HttpPlugin.init(options)
     plugin_inst.name = "http"
     plugin_inst.scopes = options.scope or options.scopes or {}
     plugin_inst.allow_insecure_tls = options.allow_insecure_tls == true or (type(options.danger) == "table" and options.danger.acceptInvalidCerts == true)
+    plugin_inst.cookie_jar = options.cookieJar or options.cookie_jar or options.cookieFile or options.cookie_file
     plugin_inst.app = nil
 
     return {
@@ -552,6 +589,7 @@ function HttpPlugin.init(options)
                         this.statusText = payload.statusText;
                         this.ok = payload.ok;
                         this.headers = new Headers(payload.headers || {});
+                        this.cookies = payload.cookies || [];
                         this.url = payload.url;
                         this._data = payload.data || "";
                     }
@@ -580,5 +618,8 @@ function HttpPlugin.init(options)
 end
 
 
-pcall(function() package.loaded["tauri.plugin.http"] = HttpPlugin end)
+pcall(function()
+    package.loaded["tauri.plugin.http"] = HttpPlugin
+    package.loaded["http"] = HttpPlugin
+end)
 return HttpPlugin

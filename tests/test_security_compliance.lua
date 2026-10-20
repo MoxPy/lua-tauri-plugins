@@ -281,6 +281,37 @@ it("SQL Connection Scope restricts database connections and masks credentials", 
     assert(string.find(tostring(err2), "admin:***", 1, true), "Masked pattern expected")
 end)
 
+it("HTTP Cookie Jar and Set-Cookie management", function()
+    local app = create_mock_app("http-cookie-app")
+    local cj = "/tmp/test_http_compliance_cj_" .. os.time() .. ".txt"
+    local plugin = HttpPlugin.init({
+        cookie_jar = cj,
+        scopes = { allow = { "https://httpbin.org/*" } }
+    })
+    plugin.setup(app, plugin)
+
+    local r1 = app.handlers["plugin:http|fetch"]({
+        url = "https://httpbin.org/cookies/set?session_token=test_abc123",
+        options = { maxRedirections = 0 }
+    })
+    assert(r1.status == 302, "Expected 302 redirect")
+    assert(#r1.cookies > 0, "Expected cookies captured")
+    local found = false
+    for _, c in ipairs(r1.cookies) do
+        if c:find("session_token=test_abc123") then found = true end
+    end
+    assert(found, "Set-Cookie must contain session_token")
+
+    -- Second request checks cookie jar persistence
+    local r2 = app.handlers["plugin:http|fetch"]({
+        url = "https://httpbin.org/cookies",
+        options = {}
+    })
+    assert(r2.ok, "Expected 200 OK")
+    assert(string.find(r2.data, "test_abc123", 1, true), "Cookie must persist in cookie jar")
+    pcall(os.remove, cj)
+end)
+
 print(string.format("\n======================================================="))
 print(string.format("ALL %d COMPLIANCE TESTS PASSED SUCCESSFULLY!", passed_count))
 print("=======================================================\n")
